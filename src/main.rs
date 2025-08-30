@@ -57,7 +57,7 @@ fn main() {
     let args = Args::parse();
     let root = Path::new(&args.dir);
     let start = Instant::now();
-    let mut folder_sizes: Vec<(OsString, u64)> = Vec::new();
+    let mut item_sizes: Vec<(OsString, u64, bool)> = Vec::new(); // (name, size, is_dir)
     let read_dir = match fs::read_dir(root) {
         Ok(rd) => rd,
         Err(e) => {
@@ -74,19 +74,26 @@ fn main() {
             Ok(m) => m,
             Err(_) => continue,
         };
-        if meta.is_dir() && !is_symlink_or_junction(&meta) {
+        if is_symlink_or_junction(&meta) {
+            continue;
+        }
+        if meta.is_dir() {
             let folder_path = entry.path();
             print!("\rScanning: {}", folder_path.display());
             io::Write::flush(&mut io::stdout()).ok();
             let size = get_folder_size(&folder_path);
-            folder_sizes.push((entry.file_name(), size));
+            item_sizes.push((entry.file_name(), size, true));
+        } else {
+            let size = meta.file_size();
+            item_sizes.push((entry.file_name(), size, false));
         }
     }
     println!("\rDone scanning.\n");
-    folder_sizes.sort_by(|a, b| b.1.cmp(&a.1));
-    println!("Folders by size:");
-    for (name, size) in folder_sizes {
-        println!("{:>12} \t{:?}", format_size(size), name);
+    item_sizes.sort_by(|a, b| b.1.cmp(&a.1));
+    println!("Items by size:");
+    for (name, size, is_dir) in item_sizes {
+        let kind = if is_dir { "[DIR]" } else { "[FILE]" };
+        println!("{:>12} {}\t{:?}", format_size(size), kind, name);
     }
 fn format_size(size: u64) -> String {
     const KB: u64 = 1024;
