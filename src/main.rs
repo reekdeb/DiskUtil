@@ -15,6 +15,10 @@ struct Args {
     /// Directory to scan
     #[arg(default_value = ".")]
     dir: String,
+
+    /// Exclude files from listing (only show folders)
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    include_files: bool,
 }
 
 fn is_symlink_or_junction(meta: &Metadata) -> bool {
@@ -83,7 +87,7 @@ fn main() {
             io::Write::flush(&mut io::stdout()).ok();
             let size = get_folder_size(&folder_path);
             item_sizes.push((entry.file_name(), size, true));
-        } else {
+        } else if args.include_files {
             let size = meta.file_size();
             item_sizes.push((entry.file_name(), size, false));
         }
