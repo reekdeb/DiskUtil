@@ -92,7 +92,8 @@ fn main() {
             item_sizes.push((entry.file_name(), size, false));
         }
     }
-    println!("\rDone scanning.\n");
+    // Clear the status line by overwriting with spaces, then return to start
+    print!("\r{:width$}\r", "", width=80);
     item_sizes.sort_by(|a, b| b.1.cmp(&a.1));
     println!("Items by size:");
     for (name, size, is_dir) in item_sizes {
