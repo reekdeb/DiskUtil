@@ -199,6 +199,18 @@ fn main() {
     }
 
     // Otherwise, default behaviour: list top-level items (folders and optionally files)
+    // Apply min_size and limit to top-level listing as well.
+    let min_size_top = match &args.min_size {
+        Some(s) => match parse_size(s) {
+            Some(v) => v,
+            None => {
+                eprintln!("Invalid --min-size value: {}", s);
+                return;
+            }
+        },
+        None => 0u64,
+    };
+
     let mut item_sizes: Vec<(OsString, u64, bool)> = Vec::new(); // (name, size, is_dir)
     let read_dir = match fs::read_dir(root) {
         Ok(rd) => rd,
@@ -224,15 +236,22 @@ fn main() {
             print!("\rScanning: {}", folder_path.display());
             io::stdout().flush().ok();
             let size = get_folder_size(&folder_path);
-            item_sizes.push((entry.file_name(), size, true));
+            if size >= min_size_top {
+                item_sizes.push((entry.file_name(), size, true));
+            }
         } else if !args.exclude_files {
             let size = meta.len();
-            item_sizes.push((entry.file_name(), size, false));
+            if size >= min_size_top {
+                item_sizes.push((entry.file_name(), size, false));
+            }
         }
     }
     // Clear the status line by overwriting with spaces, then return to start
     print!("\r{:width$}\r", "", width = 120);
     item_sizes.sort_by(|a, b| b.1.cmp(&a.1));
+    if let Some(limit) = args.limit {
+        item_sizes.truncate(limit);
+    }
     println!("Items by size:");
     for (name, size, is_dir) in item_sizes {
         let kind = if is_dir { "[DIR]" } else { "[FILE]" };
