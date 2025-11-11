@@ -35,6 +35,9 @@ diskutil.exe "C:\Path\To\Folder" --exclude-files
 
 - `dir` (optional): Directory to scan. Defaults to current directory.
 - `--exclude-files`: Exclude files from the listing (only show folders).
+- `--list-files`: Recursively scan and list individual files by size instead of top-level folders.
+- `--min-size <value>`: Filter results to only show items at or above this size. Accepts human-friendly values like `10MB`, `1.5G`, `1024` (bytes), and supports `B`, `K`, `KB`, `M`, `MB`, `G`, `GB`, `T`, `TB`.
+- `--limit <n>`: Limit the number of results shown to the top `n` items.
 
 ## Example Output
 
@@ -47,6 +50,19 @@ Items by size:
    130 bytes [FILE]     "Cargo.toml"
      8 bytes [FILE]     ".gitignore"
 Elapsed: 11.99ms
+```
+
+## Examples
+
+```powershell
+# Top-level listing, include files, no filter
+diskutil.exe
+
+# Top-level, only items >= 10 MB, show top 10
+diskutil.exe . --min-size 10MB --limit 10
+
+# Recursively list largest files >= 5MB, show top 20
+diskutil.exe C:\Projects\Rust\DiskUtil --list-files --min-size 5MB --limit 20
 ```
 
 ## License
