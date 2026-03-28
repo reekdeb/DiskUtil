@@ -159,6 +159,24 @@ fn collect_files_recursive(root: &Path, min_size: u64) -> Vec<(PathBuf, u64)> {
     result
 }
 
+fn supports_hyperlinks() -> bool {
+    std::env::var("WT_SESSION").is_ok()
+}
+
+fn path_to_file_uri(path: &Path) -> String {
+    let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let s = canonical.to_string_lossy();
+    // Strip Windows extended-length prefix "\\?\" (4 chars: \, \, ?, \)
+    let s = s.strip_prefix("\\\\?\\").unwrap_or(&s).to_owned();
+    let s = s.replace('\\', "/");
+    let s = s.replace(' ', "%20").replace('#', "%23").replace('?', "%3F");
+    format!("file:///{}", s)
+}
+
+fn osc8_link(uri: &str, text: &str) -> String {
+    format!("\x1b]8;;{}\x1b\\{}\x1b]8;;\x1b\\", uri, text)
+}
+
 fn main() {
     let args = Args::parse();
     let root = Path::new(&args.dir);
@@ -168,6 +186,8 @@ fn main() {
         eprintln!("Path does not exist: {}", root.display());
         std::process::exit(2);
     }
+    let canonical_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let hyperlinks = supports_hyperlinks();
 
     // If --list-files is specified, do a recursive file scan and show largest files
     if args.list_files {
@@ -192,7 +212,18 @@ fn main() {
         print!("\r{:width$}\r", "", width = 120);
         println!("Largest files:");
         for (path, size) in files {
-            println!("{:>12} [FILE]\t{}", format_size(size), path.display());
+            if hyperlinks {
+                let file_uri = path_to_file_uri(&path);
+                let parent_uri = path_to_file_uri(path.parent().unwrap_or(&path));
+                println!(
+                    "{:>12} {}\t{}",
+                    format_size(size),
+                    osc8_link(&parent_uri, "[FILE]"),
+                    osc8_link(&file_uri, &path.display().to_string()),
+                );
+            } else {
+                println!("{:>12} [FILE]\t{}", format_size(size), path.display());
+            }
         }
         println!("Elapsed: {:.2?}", start.elapsed());
         return;
@@ -254,8 +285,31 @@ fn main() {
     }
     println!("Items by size:");
     for (name, size, is_dir) in item_sizes {
-        let kind = if is_dir { "[DIR]" } else { "[FILE]" };
-        println!("{:>12} {}\t{}", format_size(size), kind, name.to_string_lossy());
+        let name_str = name.to_string_lossy();
+        if hyperlinks {
+            let full_path = canonical_root.join(Path::new(&name));
+            if is_dir {
+                let dir_uri = path_to_file_uri(&full_path);
+                println!(
+                    "{:>12} {}\t{}",
+                    format_size(size),
+                    osc8_link(&dir_uri, "[DIR]"),
+                    osc8_link(&dir_uri, &name_str),
+                );
+            } else {
+                let file_uri = path_to_file_uri(&full_path);
+                let parent_uri = path_to_file_uri(&canonical_root);
+                println!(
+                    "{:>12} {}\t{}",
+                    format_size(size),
+                    osc8_link(&parent_uri, "[FILE]"),
+                    osc8_link(&file_uri, &name_str),
+                );
+            }
+        } else {
+            let kind = if is_dir { "[DIR]" } else { "[FILE]" };
+            println!("{:>12} {}\t{}", format_size(size), kind, name_str);
+        }
     }
     println!("Elapsed: {:.2?}", start.elapsed());
 }
