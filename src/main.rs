@@ -6,6 +6,8 @@ use std::collections::VecDeque;
 use std::os::windows::fs::MetadataExt;
 use std::ffi::OsString;
 use std::time::Instant;
+use glob::MatchOptions;
+use regex::Regex;
 
 /// Disk usage utility
 #[derive(Parser)]
@@ -30,7 +32,98 @@ struct Args {
     /// Limit the number of results shown
     #[arg(long)]
     limit: Option<usize>,
+
+    /// Glob pattern(s) to filter files/folders (e.g. *.rs, *-suffix.txt). Can be specified multiple times.
+    #[arg(long = "glob", value_name = "PATTERN")]
+    globs: Vec<String>,
+
+    /// Regex pattern(s) to filter files/folders. Can be specified multiple times.
+    #[arg(long = "regex", value_name = "PATTERN")]
+    regexes: Vec<String>,
+
+    /// Match patterns against the full path instead of just the file/folder name
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    match_path: bool,
+
+    /// Use case-insensitive pattern matching (default is case-sensitive)
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    ignore_case: bool,
 }
+
+// ---------------------------------------------------------------------------
+// Pattern filtering
+// ---------------------------------------------------------------------------
+
+struct PatternFilter {
+    globs: Vec<glob::Pattern>,
+    regexes: Vec<Regex>,
+    match_path: bool,
+    match_opts: MatchOptions,
+}
+
+impl PatternFilter {
+    fn build(args: &Args) -> Result<Self, String> {
+        let match_opts = MatchOptions {
+            case_sensitive: !args.ignore_case,
+            require_literal_separator: false,
+            require_literal_leading_dot: false,
+        };
+        let mut globs = Vec::new();
+        for raw in &args.globs {
+            match glob::Pattern::new(raw) {
+                Ok(p) => globs.push(p),
+                Err(e) => return Err(format!("Invalid glob pattern {:?}: {}", raw, e)),
+            }
+        }
+        let mut regexes = Vec::new();
+        for raw in &args.regexes {
+            let pattern = if args.ignore_case {
+                format!("(?i){}", raw)
+            } else {
+                raw.clone()
+            };
+            match Regex::new(&pattern) {
+                Ok(r) => regexes.push(r),
+                Err(e) => return Err(format!("Invalid regex pattern {:?}: {}", raw, e)),
+            }
+        }
+        Ok(PatternFilter { globs, regexes, match_path: args.match_path, match_opts })
+    }
+
+    fn is_active(&self) -> bool {
+        !self.globs.is_empty() || !self.regexes.is_empty()
+    }
+
+    /// Returns true if the given entry (either a file or directory) matches any pattern.
+    /// `name` is just the file/folder name; `full_path` is the canonical path.
+    fn matches(&self, name: &str, full_path: &Path) -> bool {
+        // On Windows normalise separators to forward-slash so glob patterns like **/src/*.rs work.
+        let path_str = full_path.to_string_lossy().replace('\\', "/");
+        let subject_path: &str = &path_str;
+        let subject_name: &str = name;
+
+        for g in &self.globs {
+            if self.match_path {
+                if g.matches_with(subject_path, self.match_opts) {
+                    return true;
+                }
+            } else {
+                if g.matches_with(subject_name, self.match_opts) {
+                    return true;
+                }
+            }
+        }
+        for r in &self.regexes {
+            let haystack = if self.match_path { subject_path } else { subject_name };
+            if r.is_match(haystack) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+// ---------------------------------------------------------------------------
 
 fn is_symlink_or_junction(meta: &fs::Metadata) -> bool {
     // On Windows, FILE_ATTRIBUTE_REPARSE_POINT means symlink/junction
@@ -122,8 +215,47 @@ fn get_folder_size(path: &Path) -> u64 {
     size
 }
 
+/// Like `get_folder_size` but only counts files that match the given filter.
+fn get_filtered_folder_size(path: &Path, filter: &PatternFilter) -> u64 {
+    let mut size = 0u64;
+    let mut stack = VecDeque::new();
+    stack.push_back(path.to_path_buf());
+    while let Some(current) = stack.pop_front() {
+        let read_dir = match fs::read_dir(&current) {
+            Ok(rd) => rd,
+            Err(_) => continue,
+        };
+        for entry in read_dir {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            let meta = match entry.metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if is_symlink_or_junction(&meta) {
+                continue;
+            }
+            if meta.is_dir() {
+                stack.push_back(entry.path());
+            } else {
+                let file_path = entry.path();
+                let name = file_path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                if filter.matches(&name, &file_path) {
+                    size = size.saturating_add(meta.len());
+                }
+            }
+        }
+    }
+    size
+}
+
 /// Recursively collect files (path + size) under `root`, skipping reparse points.
-fn collect_files_recursive(root: &Path, min_size: u64) -> Vec<(PathBuf, u64)> {
+fn collect_files_recursive(root: &Path, min_size: u64, filter: Option<&PatternFilter>) -> Vec<(PathBuf, u64)> {
     let mut result = Vec::new();
     let mut stack = VecDeque::new();
     stack.push_back(root.to_path_buf());
@@ -151,12 +283,43 @@ fn collect_files_recursive(root: &Path, min_size: u64) -> Vec<(PathBuf, u64)> {
             } else {
                 let size = meta.len();
                 if size >= min_size {
-                    result.push((entry.path(), size));
+                    let file_path = entry.path();
+                    let include = match filter {
+                        Some(f) => {
+                            let name = file_path
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_default();
+                            f.matches(&name, &file_path)
+                        }
+                        None => true,
+                    };
+                    if include {
+                        result.push((file_path, size));
+                    }
                 }
             }
         }
     }
     result
+}
+
+fn supports_hyperlinks() -> bool {
+    std::env::var("WT_SESSION").is_ok()
+}
+
+fn path_to_file_uri(path: &Path) -> String {
+    let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let s = canonical.to_string_lossy();
+    // Strip Windows extended-length prefix "\\?\" (4 chars: \, \, ?, \)
+    let s = s.strip_prefix("\\\\?\\").unwrap_or(&s).to_owned();
+    let s = s.replace('\\', "/");
+    let s = s.replace(' ', "%20").replace('#', "%23").replace('?', "%3F");
+    format!("file:///{}", s)
+}
+
+fn osc8_link(uri: &str, text: &str) -> String {
+    format!("\x1b]8;;{}\x1b\\{}\x1b]8;;\x1b\\", uri, text)
 }
 
 fn main() {
@@ -168,6 +331,17 @@ fn main() {
         eprintln!("Path does not exist: {}", root.display());
         std::process::exit(2);
     }
+    let canonical_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let hyperlinks = supports_hyperlinks();
+
+    let filter = match PatternFilter::build(&args) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+    let filter_ref = if filter.is_active() { Some(&filter) } else { None };
 
     // If --list-files is specified, do a recursive file scan and show largest files
     if args.list_files {
@@ -182,7 +356,7 @@ fn main() {
             None => 0u64,
         };
 
-        let mut files = collect_files_recursive(root, min_size);
+        let mut files = collect_files_recursive(root, min_size, filter_ref);
         // sort desc by size
         files.sort_by(|a, b| b.1.cmp(&a.1));
         if let Some(limit) = args.limit {
@@ -192,7 +366,18 @@ fn main() {
         print!("\r{:width$}\r", "", width = 120);
         println!("Largest files:");
         for (path, size) in files {
-            println!("{:>12} [FILE]\t{}", format_size(size), path.display());
+            if hyperlinks {
+                let file_uri = path_to_file_uri(&path);
+                let parent_uri = path_to_file_uri(path.parent().unwrap_or(&path));
+                println!(
+                    "{:>12} {}\t{}",
+                    format_size(size),
+                    osc8_link(&parent_uri, "[FILE]"),
+                    osc8_link(&file_uri, &path.display().to_string()),
+                );
+            } else {
+                println!("{:>12} [FILE]\t{}", format_size(size), path.display());
+            }
         }
         println!("Elapsed: {:.2?}", start.elapsed());
         return;
@@ -235,14 +420,28 @@ fn main() {
             let folder_path = entry.path();
             print!("\rScanning: {}", folder_path.display());
             io::stdout().flush().ok();
-            let size = get_folder_size(&folder_path);
-            if size >= min_size_top {
+            let size = match filter_ref {
+                Some(f) => get_filtered_folder_size(&folder_path, f),
+                None => get_folder_size(&folder_path),
+            };
+            // When a filter is active, skip folders whose filtered size is zero
+            if size >= min_size_top && (size > 0 || filter_ref.is_none()) {
                 item_sizes.push((entry.file_name(), size, true));
             }
         } else if !args.exclude_files {
             let size = meta.len();
             if size >= min_size_top {
-                item_sizes.push((entry.file_name(), size, false));
+                let name = entry.file_name();
+                let include = match filter_ref {
+                    Some(f) => {
+                        let name_str = name.to_string_lossy();
+                        f.matches(&name_str, &entry.path())
+                    }
+                    None => true,
+                };
+                if include {
+                    item_sizes.push((name, size, false));
+                }
             }
         }
     }
@@ -254,8 +453,31 @@ fn main() {
     }
     println!("Items by size:");
     for (name, size, is_dir) in item_sizes {
-        let kind = if is_dir { "[DIR]" } else { "[FILE]" };
-        println!("{:>12} {}\t{}", format_size(size), kind, name.to_string_lossy());
+        let name_str = name.to_string_lossy();
+        if hyperlinks {
+            let full_path = canonical_root.join(Path::new(&name));
+            if is_dir {
+                let dir_uri = path_to_file_uri(&full_path);
+                println!(
+                    "{:>12} {}\t{}",
+                    format_size(size),
+                    osc8_link(&dir_uri, "[DIR]"),
+                    osc8_link(&dir_uri, &name_str),
+                );
+            } else {
+                let file_uri = path_to_file_uri(&full_path);
+                let parent_uri = path_to_file_uri(&canonical_root);
+                println!(
+                    "{:>12} {}\t{}",
+                    format_size(size),
+                    osc8_link(&parent_uri, "[FILE]"),
+                    osc8_link(&file_uri, &name_str),
+                );
+            }
+        } else {
+            let kind = if is_dir { "[DIR]" } else { "[FILE]" };
+            println!("{:>12} {}\t{}", format_size(size), kind, name_str);
+        }
     }
     println!("Elapsed: {:.2?}", start.elapsed());
 }
