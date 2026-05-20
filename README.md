@@ -1,13 +1,17 @@
 # DiskUtil
 
-DiskUtil is a fast and simple disk usage utility for Windows, written in Rust. It lists folders and files in a given directory by their disk usage size, in descending order. The size calculation includes all subfolders and files, but excludes junctions and symbolic links for accuracy.
+DiskUtil is a fast and simple disk usage utility for Windows, written in Rust. It lists folders and files in a given directory by their disk usage size, and can organize files into date-based subdirectories. Size calculations and file operations exclude junctions and symbolic links for accuracy.
 
 ## Features
 - Lists folders and files by size (KB, MB, GB, TB)
-- Excludes junctions and symbolic links from size calculation
+- Recursively lists and sorts individual files by size
+- Organizes files into `year/`, `year/month/`, or `year/month/day/` folders based on file timestamps
+- Preserves original file timestamps after moving
+- Removes empty directories left behind after organizing
+- Dry-run mode to preview all changes before applying them
+- Glob and regex pattern filtering
+- Excludes junctions and symbolic links from all operations
 - Shows a live status update while scanning
-- Command line option to exclude files from the listing
-- Uses the fastest available method for size calculation
 
 ## Usage
 
@@ -18,7 +22,9 @@ cargo build --release
 cargo install --path . --force
 ```
 
-### Run
+---
+
+## Disk Usage Listing
 
 ```powershell
 # Scan current directory (default)
@@ -29,41 +35,98 @@ diskutil.exe "C:\Path\To\Folder"
 
 # Exclude files from listing (only show folders)
 diskutil.exe "C:\Path\To\Folder" --exclude-files
+
+# Recursively list largest files >= 5 MB, show top 20
+diskutil.exe "C:\Path\To\Folder" --list-files --min-size 5MB --limit 20
 ```
 
-## Command Line Options
+### Options
 
-- `dir` (optional): Directory to scan. Defaults to current directory.
-- `--exclude-files`: Exclude files from the listing (only show folders).
-- `--list-files`: Recursively scan and list individual files by size instead of top-level folders.
-- `--min-size <value>`: Filter results to only show items at or above this size. Accepts human-friendly values like `10MB`, `1.5G`, `1024` (bytes), and supports `B`, `K`, `KB`, `M`, `MB`, `G`, `GB`, `T`, `TB`.
-- `--limit <n>`: Limit the number of results shown to the top `n` items.
+| Option | Description |
+|--------|-------------|
+| `[DIR]` | Directory to scan (default: `.`) |
+| `--exclude-files` | Only show folders in the top-level listing |
+| `--list-files` | Recursively list individual files sorted by size |
+| `--min-size <value>` | Filter to items at or above this size (`10MB`, `1.5G`, `1024`, etc.) |
+| `--limit <n>` | Show only the top `n` results |
+| `--glob <pattern>` | Filter by glob pattern (repeatable, e.g. `*.rs`) |
+| `--regex <pattern>` | Filter by regex pattern (repeatable) |
+| `--match-path` | Match patterns against the full path instead of just the name |
+| `--ignore-case` | Case-insensitive pattern matching |
 
-## Example Output
+### Example Output
 
 ```
 Items by size:
-   150.10 MB [DIR]      "target"
-    41.02 KB [DIR]      ".git"
-     6.81 KB [FILE]     "Cargo.lock"
-     3.58 KB [DIR]      "src"
-   130 bytes [FILE]     "Cargo.toml"
-     8 bytes [FILE]     ".gitignore"
+   150.10 MB [DIR]      target
+    41.02 KB [DIR]      .git
+     6.81 KB [FILE]     Cargo.lock
+     3.58 KB [DIR]      src
+   130 bytes [FILE]     Cargo.toml
 Elapsed: 11.99ms
 ```
 
-## Examples
+---
+
+## Organize Files by Date
+
+Recursively moves files in a folder into date-based subdirectories determined by each file's timestamp. Original timestamps are restored after every move, and empty source directories are deleted.
 
 ```powershell
-# Top-level listing, include files, no filter
-diskutil.exe
-
-# Top-level, only items >= 10 MB, show top 10
-diskutil.exe . --min-size 10MB --limit 10
-
-# Recursively list largest files >= 5MB, show top 20
-diskutil.exe C:\Projects\Rust\DiskUtil --list-files --min-size 5MB --limit 20
+diskutil.exe organize [DIR] [OPTIONS]
 ```
+
+### Options
+
+| Option | Description |
+|--------|-------------|
+| `[DIR]` | Directory to organize (default: `.`) |
+| `--by <granularity>` | Folder depth: `year`, `month` (default), or `day` |
+| `--timestamp <source>` | Timestamp to use: `modified` (default) or `created` |
+| `--dry-run` | Preview all changes without touching the filesystem |
+
+### Folder structure created
+
+| `--by` | Example path |
+|--------|--------------|
+| `year` | `Photos/2024/IMG_001.jpg` |
+| `month` | `Photos/2024/03/IMG_001.jpg` |
+| `day` | `Photos/2024/03/15/IMG_001.jpg` |
+
+Month and day folders use zero-padded numbers (`01`–`12`, `01`–`31`).
+
+### Conflict handling
+
+If a file with the same name already exists at the destination, the source file is **skipped** and logged — it is never overwritten.
+
+### Examples
+
+```powershell
+# Preview what would happen (no changes made)
+diskutil.exe organize "D:\Photos" --by day --dry-run
+
+# Organize by year/month using last-modified time (default)
+diskutil.exe organize "D:\Photos" --by month
+
+# Organize by year only, using file creation time
+diskutil.exe organize "D:\Downloads" --by year --timestamp created
+
+# Organize current directory by year/month/day
+diskutil.exe organize --by day
+```
+
+### Example Output
+
+```
+Moved: D:\Photos\IMG_001.jpg -> D:\Photos\2024\03\15\IMG_001.jpg
+Moved: D:\Photos\IMG_002.jpg -> D:\Photos\2024\03\15\IMG_002.jpg
+Skipped (conflict): D:\Photos\IMG_003.jpg -> D:\Photos\2024\03\15\IMG_003.jpg
+Removed empty dir: D:\Photos\Unsorted
+
+Done: 2 moved, 1 skipped (conflict), 1 dir(s) removed, 0 error(s). Elapsed: 3.20ms
+```
+
+---
 
 ## License
 MIT
