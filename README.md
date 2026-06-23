@@ -3,15 +3,17 @@
 DiskUtil is a fast and simple disk usage utility for Windows, written in Rust. It lists folders and files in a given directory by their disk usage size, and can organize files into date-based subdirectories. Size calculations and file operations exclude junctions and symbolic links for accuracy.
 
 ## Features
-- Lists folders and files by size (KB, MB, GB, TB)
-- Recursively lists and sorts individual files by size
-- Organizes files into `year/`, `year/month/`, or `year/month/day/` folders based on file timestamps
-- Preserves original file timestamps after moving
-- Removes empty directories left behind after organizing
-- Dry-run mode to preview all changes before applying them
-- Glob and regex pattern filtering
-- Excludes junctions and symbolic links from all operations
-- Shows a live status update while scanning
+- **Disk usage analysis**: Lists folders and files by size (KB, MB, GB, TB)
+- **File discovery**: Recursively lists and sorts individual files by size
+- **File organization**: Automatically organizes files into `year/`, `year/month/`, or `year/month/day/` folders based on file timestamps
+- **Timestamp preservation**: Preserves original file timestamps after moving
+- **Cleanup**: Removes empty directories left behind after organizing
+- **Safe operations**: Dry-run mode to preview all changes before applying them
+- **Flexible filtering**: Glob and regex pattern matching (repeatable, with full-path matching option)
+- **Case-insensitive matching**: Optional case-insensitive pattern filtering
+- **Safe file handling**: Excludes junctions and symbolic links from all operations
+- **Live feedback**: Shows scanning progress updates during operations
+- **Windows Terminal integration**: Clickable hyperlinks to files and folders in Windows Terminal
 
 ## Usage
 
@@ -129,7 +131,7 @@ Done: 2 moved, 1 skipped (conflict), 1 dir(s) removed, 0 error(s). Elapsed: 3.20
 ---
 
 ## License
-MIT
+GNU General Public License v3.0
 
 ---
 
