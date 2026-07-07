@@ -731,7 +731,12 @@ fn organize_to_dest(args: &OrganizeArgs, dest: &str) {
     }
 
     // --- Phase 1: collect all files recursively, applying the pattern filter ---
+    // Also tally the *unfiltered* file count per directory (dir_total_counts), since a
+    // directory only truly becomes empty once every file in it (matched or not) is gone —
+    // not just the ones that happen to match --glob/--regex.
     let mut all_files: Vec<PathBuf> = Vec::new();
+    use std::collections::HashMap;
+    let mut dir_total_counts: HashMap<PathBuf, usize> = HashMap::new();
     let mut stack: VecDeque<PathBuf> = VecDeque::new();
     stack.push_back(source_root.clone());
     while let Some(current) = stack.pop_front() {
@@ -755,6 +760,9 @@ fn organize_to_dest(args: &OrganizeArgs, dest: &str) {
             if meta.is_dir() {
                 stack.push_back(path);
             } else {
+                if let Some(parent) = path.parent() {
+                    *dir_total_counts.entry(parent.to_path_buf()).or_insert(0) += 1;
+                }
                 if filter.is_active() {
                     let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
                     if !filter.matches(&name, &path) {
@@ -774,14 +782,12 @@ fn organize_to_dest(args: &OrganizeArgs, dest: &str) {
     let mut planned: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
 
     // For move + dry-run empty-dir prediction: track (total, moving) files per source dir.
-    use std::collections::HashMap;
+    // `total` is seeded from dir_total_counts (ALL files, not just filtered ones), so a
+    // directory is only predicted as removable when nothing — matched or not — is left in it.
     let mut dir_file_counts: HashMap<PathBuf, (usize, usize)> = HashMap::new();
     if dry_run && !copy {
-        for file in &all_files {
-            if let Some(parent) = file.parent() {
-                let entry = dir_file_counts.entry(parent.to_path_buf()).or_insert((0, 0));
-                entry.0 += 1;
-            }
+        for (dir, total) in &dir_total_counts {
+            dir_file_counts.insert(dir.clone(), (*total, 0));
         }
     }
 
