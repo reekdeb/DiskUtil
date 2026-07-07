@@ -67,6 +67,17 @@ struct OrganizeArgs {
     #[arg(default_value = ".")]
     dir: String,
 
+    /// Destination root directory. If omitted, files are reorganized in place within `dir`
+    /// (existing behavior, always by timestamp).
+    #[arg(long)]
+    dest: Option<String>,
+
+    /// Layout mode when --dest is given: recreate the source folder structure ("structure"),
+    /// organize into date-based subdirectories ("timestamp"), or put everything directly in
+    /// the destination directory ("flatten"). Ignored (always "timestamp") when --dest is omitted.
+    #[arg(long, default_value = "timestamp", value_parser = ["timestamp", "structure", "flatten"])]
+    mode: String,
+
     /// Folder granularity: year, month (year/month), or day (year/month/day)
     #[arg(long, default_value = "month", value_parser = ["year", "month", "day"])]
     by: String,
@@ -74,6 +85,31 @@ struct OrganizeArgs {
     /// Which file timestamp to use for date determination
     #[arg(long, default_value = "modified", value_parser = ["modified", "created"])]
     timestamp: String,
+
+    /// Copy files instead of moving them. Only meaningful with --dest; source is left untouched.
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    copy: bool,
+
+    /// How to resolve a filename collision at the destination: auto-rename with a " (1)"
+    /// suffix, skip the file, or overwrite the existing file.
+    #[arg(long = "on-conflict", default_value = "rename", value_parser = ["rename", "skip", "overwrite"])]
+    on_conflict: String,
+
+    /// Glob pattern(s) to filter which files are organized (e.g. *.jpg). Can be specified multiple times.
+    #[arg(long = "glob", value_name = "PATTERN")]
+    globs: Vec<String>,
+
+    /// Regex pattern(s) to filter which files are organized. Can be specified multiple times.
+    #[arg(long = "regex", value_name = "PATTERN")]
+    regexes: Vec<String>,
+
+    /// Match glob/regex patterns against the full path instead of just the file name
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    match_path: bool,
+
+    /// Use case-insensitive pattern matching (default is case-sensitive)
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    ignore_case: bool,
 
     /// Preview changes without making them
     #[arg(long, action = clap::ArgAction::SetTrue)]
@@ -93,31 +129,35 @@ struct PatternFilter {
 
 impl PatternFilter {
     fn build(args: &Args) -> Result<Self, String> {
+        Self::build_from(&args.globs, &args.regexes, args.match_path, args.ignore_case)
+    }
+
+    fn build_from(globs: &[String], regexes: &[String], match_path: bool, ignore_case: bool) -> Result<Self, String> {
         let match_opts = MatchOptions {
-            case_sensitive: !args.ignore_case,
+            case_sensitive: !ignore_case,
             require_literal_separator: false,
             require_literal_leading_dot: false,
         };
-        let mut globs = Vec::new();
-        for raw in &args.globs {
+        let mut compiled_globs = Vec::new();
+        for raw in globs {
             match glob::Pattern::new(raw) {
-                Ok(p) => globs.push(p),
+                Ok(p) => compiled_globs.push(p),
                 Err(e) => return Err(format!("Invalid glob pattern {:?}: {}", raw, e)),
             }
         }
-        let mut regexes = Vec::new();
-        for raw in &args.regexes {
-            let pattern = if args.ignore_case {
+        let mut compiled_regexes = Vec::new();
+        for raw in regexes {
+            let pattern = if ignore_case {
                 format!("(?i){}", raw)
             } else {
                 raw.clone()
             };
             match Regex::new(&pattern) {
-                Ok(r) => regexes.push(r),
+                Ok(r) => compiled_regexes.push(r),
                 Err(e) => return Err(format!("Invalid regex pattern {:?}: {}", raw, e)),
             }
         }
-        Ok(PatternFilter { globs, regexes, match_path: args.match_path, match_opts })
+        Ok(PatternFilter { globs: compiled_globs, regexes: compiled_regexes, match_path, match_opts })
     }
 
     fn is_active(&self) -> bool {
@@ -378,6 +418,13 @@ fn file_timestamp(meta: &fs::Metadata, use_created: bool) -> Option<SystemTime> 
 }
 
 fn organize_files(args: &OrganizeArgs) {
+    match &args.dest {
+        None => organize_in_place(args),
+        Some(dest) => organize_to_dest(args, dest),
+    }
+}
+
+fn organize_in_place(args: &OrganizeArgs) {
     let root = Path::new(&args.dir);
     if !root.exists() {
         eprintln!("Path does not exist: {}", root.display());
@@ -591,6 +638,320 @@ fn organize_files(args: &OrganizeArgs) {
         println!(
             "Done: {} moved, {} skipped (conflict), {} dir(s) removed, {} error(s). Elapsed: {:.2?}",
             moved_count, skipped_conflict, removed_dirs, error_count, start.elapsed()
+        );
+    }
+}
+
+/// Outcome of resolving a potential filename collision at a destination path.
+enum ConflictOutcome {
+    /// Proceed using this (possibly renamed) destination path.
+    Proceed(PathBuf),
+    /// Skip this file entirely.
+    Skip,
+}
+
+/// Given a desired destination path, check for collisions against both the filesystem and
+/// paths already claimed earlier in this run (`planned`), and resolve according to `strategy`
+/// ("rename", "skip", or "overwrite"). On success, the returned path is inserted into `planned`.
+fn resolve_conflict(dest: &Path, planned: &mut std::collections::HashSet<PathBuf>, strategy: &str) -> ConflictOutcome {
+    let collides = |p: &Path| p.exists() || planned.contains(p);
+    if !collides(dest) {
+        planned.insert(dest.to_path_buf());
+        return ConflictOutcome::Proceed(dest.to_path_buf());
+    }
+    match strategy {
+        "skip" => ConflictOutcome::Skip,
+        "overwrite" => {
+            planned.insert(dest.to_path_buf());
+            ConflictOutcome::Proceed(dest.to_path_buf())
+        }
+        _ => {
+            // "rename": append " (1)", " (2)", ... before the extension until free.
+            let parent = dest.parent().unwrap_or_else(|| Path::new(""));
+            let stem = dest.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+            let ext = dest.extension().map(|e| e.to_string_lossy().to_string());
+            let mut n = 1u64;
+            loop {
+                let candidate_name = match &ext {
+                    Some(e) => format!("{} ({}).{}", stem, n, e),
+                    None => format!("{} ({})", stem, n),
+                };
+                let candidate = parent.join(candidate_name);
+                if !collides(&candidate) {
+                    planned.insert(candidate.clone());
+                    return ConflictOutcome::Proceed(candidate);
+                }
+                n += 1;
+            }
+        }
+    }
+}
+
+fn organize_to_dest(args: &OrganizeArgs, dest: &str) {
+    let source_root = Path::new(&args.dir);
+    if !source_root.exists() {
+        eprintln!("Path does not exist: {}", source_root.display());
+        std::process::exit(2);
+    }
+    let source_root = match fs::canonicalize(source_root) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Cannot canonicalize path: {}", e);
+            std::process::exit(2);
+        }
+    };
+
+    let dest_root = PathBuf::from(dest);
+    if !args.dry_run {
+        if let Err(e) = fs::create_dir_all(&dest_root) {
+            eprintln!("Cannot create destination directory {}: {}", dest_root.display(), e);
+            std::process::exit(2);
+        }
+    }
+    let dest_root = match fs::canonicalize(&dest_root) {
+        Ok(p) => p,
+        Err(_) => dest_root, // dry-run: destination may not exist yet
+    };
+
+    let filter = match PatternFilter::build_from(&args.globs, &args.regexes, args.match_path, args.ignore_case) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("{}", e);
+            std::process::exit(2);
+        }
+    };
+
+    let use_created = args.timestamp == "created";
+    let dry_run = args.dry_run;
+    let copy = args.copy;
+    let start = Instant::now();
+
+    if dry_run {
+        println!("[DRY RUN] No changes will be made.\n");
+    }
+
+    // --- Phase 1: collect all files recursively, applying the pattern filter ---
+    let mut all_files: Vec<PathBuf> = Vec::new();
+    let mut stack: VecDeque<PathBuf> = VecDeque::new();
+    stack.push_back(source_root.clone());
+    while let Some(current) = stack.pop_front() {
+        let rd = match fs::read_dir(&current) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        for entry in rd {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            let meta = match entry.metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if is_symlink_or_junction(&meta) {
+                continue;
+            }
+            let path = entry.path();
+            if meta.is_dir() {
+                stack.push_back(path);
+            } else {
+                if filter.is_active() {
+                    let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                    if !filter.matches(&name, &path) {
+                        continue;
+                    }
+                }
+                all_files.push(path);
+            }
+        }
+    }
+
+    // --- Phase 2: build copy/move plan ---
+    let mut done_count: u64 = 0;
+    let mut skipped_conflict: u64 = 0;
+    let mut renamed_count: u64 = 0;
+    let mut error_count: u64 = 0;
+    let mut planned: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+
+    // For move + dry-run empty-dir prediction: track (total, moving) files per source dir.
+    use std::collections::HashMap;
+    let mut dir_file_counts: HashMap<PathBuf, (usize, usize)> = HashMap::new();
+    if dry_run && !copy {
+        for file in &all_files {
+            if let Some(parent) = file.parent() {
+                let entry = dir_file_counts.entry(parent.to_path_buf()).or_insert((0, 0));
+                entry.0 += 1;
+            }
+        }
+    }
+
+    let verb = if copy { "copy" } else { "move" };
+    let verb_past = if copy { "Copied" } else { "Moved" };
+    let verb_would = if copy { "Would copy" } else { "Would move" };
+
+    for file in &all_files {
+        let meta = match fs::metadata(file) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("Cannot read metadata for {}: {}", file.display(), e);
+                error_count += 1;
+                continue;
+            }
+        };
+
+        let desired_dest = match args.mode.as_str() {
+            "structure" => {
+                let rel = match file.strip_prefix(&source_root) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+                dest_root.join(rel)
+            }
+            "flatten" => {
+                let file_name = match file.file_name() {
+                    Some(n) => n,
+                    None => continue,
+                };
+                dest_root.join(file_name)
+            }
+            _ => {
+                // "timestamp"
+                let sys_time = match file_timestamp(&meta, use_created) {
+                    Some(t) => t,
+                    None => {
+                        eprintln!("Cannot read timestamp for {}: skipping", file.display());
+                        error_count += 1;
+                        continue;
+                    }
+                };
+                let local_dt: DateTime<Local> = sys_time.into();
+                let year = local_dt.format("%Y").to_string().parse::<i32>().unwrap_or(1970);
+                let month = local_dt.format("%m").to_string().parse::<u32>().unwrap_or(1);
+                let day = local_dt.format("%d").to_string().parse::<u32>().unwrap_or(1);
+                let dest_dir = date_subdir(&dest_root, year, month, day, &args.by);
+                let file_name = match file.file_name() {
+                    Some(n) => n,
+                    None => continue,
+                };
+                dest_dir.join(file_name)
+            }
+        };
+
+        let dest_file = match resolve_conflict(&desired_dest, &mut planned, &args.on_conflict) {
+            ConflictOutcome::Proceed(p) => {
+                if p != desired_dest {
+                    renamed_count += 1;
+                }
+                p
+            }
+            ConflictOutcome::Skip => {
+                println!("Skipped (conflict): {}", file.display());
+                skipped_conflict += 1;
+                continue;
+            }
+        };
+        let dest_dir = match dest_file.parent() {
+            Some(d) => d.to_path_buf(),
+            None => continue,
+        };
+
+        if dry_run {
+            println!("{}: {} -> {}", verb_would, file.display(), dest_file.display());
+            done_count += 1;
+            if !copy {
+                if let Some(parent) = file.parent() {
+                    let entry = dir_file_counts.entry(parent.to_path_buf()).or_insert((0, 0));
+                    entry.1 += 1;
+                }
+            }
+        } else {
+            let mtime = FileTime::from_last_modification_time(&meta);
+            let atime = FileTime::from_last_access_time(&meta);
+
+            if let Err(e) = fs::create_dir_all(&dest_dir) {
+                eprintln!("Cannot create directory {}: {}", dest_dir.display(), e);
+                error_count += 1;
+                continue;
+            }
+
+            let op_result = if copy {
+                fs::copy(file, &dest_file).map(|_| ())
+            } else {
+                fs::rename(file, &dest_file)
+            };
+            if let Err(e) = op_result {
+                eprintln!("Cannot {} {} -> {}: {}", verb, file.display(), dest_file.display(), e);
+                error_count += 1;
+                continue;
+            }
+            if let Err(e) = set_file_times(&dest_file, atime, mtime) {
+                eprintln!("Warning: could not restore timestamps on {}: {}", dest_file.display(), e);
+            }
+            println!("{}: {} -> {}", verb_past, file.display(), dest_file.display());
+            done_count += 1;
+        }
+    }
+
+    // --- Phase 3: remove now-empty source directories (move mode only) ---
+    let mut removed_dirs: u64 = 0;
+    if !copy {
+        if dry_run {
+            let mut candidate_dirs: Vec<PathBuf> = dir_file_counts
+                .iter()
+                .filter(|(dir, (total, moving))| *moving == *total && **dir != source_root)
+                .map(|(dir, _)| dir.clone())
+                .collect();
+            candidate_dirs.sort_by(|a, b| b.components().count().cmp(&a.components().count()));
+            for dir in candidate_dirs {
+                println!("Would remove empty dir: {}", dir.display());
+                removed_dirs += 1;
+            }
+        } else {
+            let mut all_dirs: Vec<PathBuf> = Vec::new();
+            let mut stack: VecDeque<PathBuf> = VecDeque::new();
+            stack.push_back(source_root.clone());
+            while let Some(current) = stack.pop_front() {
+                let rd = match fs::read_dir(&current) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+                for entry in rd {
+                    let entry = match entry { Ok(e) => e, Err(_) => continue };
+                    let meta = match entry.metadata() { Ok(m) => m, Err(_) => continue };
+                    if meta.is_dir() && !is_symlink_or_junction(&meta) {
+                        let path = entry.path();
+                        all_dirs.push(path.clone());
+                        stack.push_back(path);
+                    }
+                }
+            }
+            all_dirs.sort_by(|a, b| b.components().count().cmp(&a.components().count()));
+            for dir in all_dirs {
+                if dir == source_root {
+                    continue;
+                }
+                match fs::remove_dir(&dir) {
+                    Ok(_) => {
+                        println!("Removed empty dir: {}", dir.display());
+                        removed_dirs += 1;
+                    }
+                    Err(_) => {}
+                }
+            }
+        }
+    }
+
+    // --- Summary ---
+    println!();
+    if dry_run {
+        println!(
+            "[DRY RUN] {} file(s) would be {}, {} skipped (conflict), {} renamed to avoid conflict, {} dir(s) would be removed.",
+            done_count, if copy { "copied" } else { "moved" }, skipped_conflict, renamed_count, removed_dirs
+        );
+    } else {
+        println!(
+            "Done: {} {}, {} skipped (conflict), {} renamed to avoid conflict, {} dir(s) removed, {} error(s). Elapsed: {:.2?}",
+            done_count, if copy { "copied" } else { "moved" }, skipped_conflict, renamed_count, removed_dirs, error_count, start.elapsed()
         );
     }
 }
