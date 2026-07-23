@@ -478,7 +478,9 @@ fn organize_in_place(args: &OrganizeArgs) {
     // --- Phase 2: build move plan ---
     // moved_count, skipped_count track totals
     let mut moved_count: u64 = 0;
+    let mut moved_bytes: u64 = 0;
     let mut skipped_conflict: u64 = 0;
+    let mut skipped_bytes: u64 = 0;
     let mut error_count: u64 = 0;
 
     // For dry-run empty-dir detection: track which source dirs will lose all their files.
@@ -537,12 +539,14 @@ fn organize_in_place(args: &OrganizeArgs) {
         if dest_file.exists() {
             println!("Skipped (conflict): {}", file.display());
             skipped_conflict += 1;
+            skipped_bytes += meta.len();
             continue;
         }
 
         if dry_run {
             println!("Would move: {} -> {}", file.display(), dest_file.display());
             moved_count += 1;
+            moved_bytes += meta.len();
             // Mark this file's parent dir as having one more file that will move
             if let Some(parent) = file.parent() {
                 let entry = dir_file_counts.entry(parent.to_path_buf()).or_insert((0, 0));
@@ -569,6 +573,7 @@ fn organize_in_place(args: &OrganizeArgs) {
             }
             println!("Moved: {} -> {}", file.display(), dest_file.display());
             moved_count += 1;
+            moved_bytes += meta.len();
         }
     }
 
@@ -631,13 +636,13 @@ fn organize_in_place(args: &OrganizeArgs) {
     println!();
     if dry_run {
         println!(
-            "[DRY RUN] {} file(s) would be moved, {} skipped (conflict), {} dir(s) would be removed.",
-            moved_count, skipped_conflict, removed_dirs
+            "[DRY RUN] {} file(s) ({}) would be moved, {} skipped (conflict, {}), {} dir(s) would be removed.",
+            moved_count, format_size(moved_bytes), skipped_conflict, format_size(skipped_bytes), removed_dirs
         );
     } else {
         println!(
-            "Done: {} moved, {} skipped (conflict), {} dir(s) removed, {} error(s). Elapsed: {:.2?}",
-            moved_count, skipped_conflict, removed_dirs, error_count, start.elapsed()
+            "Done: {} moved ({}), {} skipped (conflict, {}), {} dir(s) removed, {} error(s). Elapsed: {:.2?}",
+            moved_count, format_size(moved_bytes), skipped_conflict, format_size(skipped_bytes), removed_dirs, error_count, start.elapsed()
         );
     }
 }
@@ -776,7 +781,9 @@ fn organize_to_dest(args: &OrganizeArgs, dest: &str) {
 
     // --- Phase 2: build copy/move plan ---
     let mut done_count: u64 = 0;
+    let mut done_bytes: u64 = 0;
     let mut skipped_conflict: u64 = 0;
+    let mut skipped_bytes: u64 = 0;
     let mut renamed_count: u64 = 0;
     let mut error_count: u64 = 0;
     let mut planned: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
@@ -853,6 +860,7 @@ fn organize_to_dest(args: &OrganizeArgs, dest: &str) {
             ConflictOutcome::Skip => {
                 println!("Skipped (conflict): {}", file.display());
                 skipped_conflict += 1;
+                skipped_bytes += meta.len();
                 continue;
             }
         };
@@ -864,6 +872,7 @@ fn organize_to_dest(args: &OrganizeArgs, dest: &str) {
         if dry_run {
             println!("{}: {} -> {}", verb_would, file.display(), dest_file.display());
             done_count += 1;
+            done_bytes += meta.len();
             if !copy {
                 if let Some(parent) = file.parent() {
                     let entry = dir_file_counts.entry(parent.to_path_buf()).or_insert((0, 0));
@@ -895,6 +904,7 @@ fn organize_to_dest(args: &OrganizeArgs, dest: &str) {
             }
             println!("{}: {} -> {}", verb_past, file.display(), dest_file.display());
             done_count += 1;
+            done_bytes += meta.len();
         }
     }
 
@@ -951,13 +961,15 @@ fn organize_to_dest(args: &OrganizeArgs, dest: &str) {
     println!();
     if dry_run {
         println!(
-            "[DRY RUN] {} file(s) would be {}, {} skipped (conflict), {} renamed to avoid conflict, {} dir(s) would be removed.",
-            done_count, if copy { "copied" } else { "moved" }, skipped_conflict, renamed_count, removed_dirs
+            "[DRY RUN] {} file(s) ({}) would be {}, {} skipped (conflict, {}), {} renamed to avoid conflict, {} dir(s) would be removed.",
+            done_count, format_size(done_bytes), if copy { "copied" } else { "moved" },
+            skipped_conflict, format_size(skipped_bytes), renamed_count, removed_dirs
         );
     } else {
         println!(
-            "Done: {} {}, {} skipped (conflict), {} renamed to avoid conflict, {} dir(s) removed, {} error(s). Elapsed: {:.2?}",
-            done_count, if copy { "copied" } else { "moved" }, skipped_conflict, renamed_count, removed_dirs, error_count, start.elapsed()
+            "Done: {} {} ({}), {} skipped (conflict, {}), {} renamed to avoid conflict, {} dir(s) removed, {} error(s). Elapsed: {:.2?}",
+            done_count, if copy { "copied" } else { "moved" }, format_size(done_bytes),
+            skipped_conflict, format_size(skipped_bytes), renamed_count, removed_dirs, error_count, start.elapsed()
         );
     }
 }
